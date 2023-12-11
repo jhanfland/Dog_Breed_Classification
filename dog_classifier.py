@@ -15,31 +15,90 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torchvision
+from torchvision import transforms as T
 from torchvision.transforms import v2
+from torchvision.models import segmentation
+from torchvision.models.detection import maskrcnn_resnet50_fpn
 import torch
 import torch.optim as optim
 import torch.nn as nn
-import torch.nn.functional as f
+import torch.nn.functional as F
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
 from PIL import Image
+from PIL import ImageFilter
 import requests
 import tqdm
-from google.colab import drive
+import os
+#from google.colab import drive
 
 """## Getting the Data"""
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-transforms = v2.Compose([
-    v2.Resize(256),
-    v2.CenterCrop(212),
-    v2.ToTensor(),
-    v2.RandomHorizontalFlip(p = 0.5),
-    v2.ColorJitter(0.2,0.2,0.2,0.1)
-])
-drive.mount('/content/drive')
-trainset = torchvision.datasets.ImageFolder('/content/drive/MyDrive/Dog/train/', transform = transforms)
-validset = torchvision.datasets.ImageFolder('/content/drive/MyDrive/Dog/valid/', transform = transforms)
-testset = torchvision.datasets.ImageFolder('/content/drive/MyDrive/Dog/test/', transform = transforms)
 
+visionmodel = segmentation.deeplabv3_resnet101(pretrained=True).to(device).eval()
+#a model for creating masks of certain objects within an image. Much faster than the Mask R-CNN
+visionmodel=visionmodel.to(device)
+
+def remove_background(image, threshold=0.5, buffer_size=5):
+    original = image.copy()
+    image_tensor = T.ToTensor()(image).unsqueeze(0).to(device)
+    visionmodel.eval()
+    with torch.no_grad():
+        output = visionmodel(image_tensor)['out'][0]
+    probabilities = F.softmax(output, dim=0)
+    dog_probabilities = probabilities[12]  #the class label for dog is 12
+    dog_mask = dog_probabilities > threshold #makes sure the confidence about the object being a dog is above the threshold
+
+    if dog_mask.sum() == 0:
+        return original  #if no dog is detected, return the original image
+
+    dog_mask = dog_mask.to(torch.float32).unsqueeze(0)
+
+    #this buffer helped smooth out some holes within the dog_mask. Found that a buffer_size of 5 pixels works best without adding too much background
+    dog_mask = F.max_pool2d(dog_mask.unsqueeze(0), kernel_size=2*buffer_size+1, stride=1, padding=buffer_size)
+
+
+    dog_mask = F.interpolate(dog_mask, size=image.size[::-1], mode='nearest').squeeze(0)#resizes dog_mask
+
+    #converts to PIL
+    mask_image = Image.fromarray((dog_mask.squeeze().cpu().numpy() * 255).astype(np.uint8), mode='L')
+
+    background = Image.new("RGB", image.size, (0, 255, 0))#create a new green background image
+
+    #composites the images together using the mask.
+    final_image = Image.composite(image, background, mask_image)
+
+    #calculates the percentage of the image that is the green background.
+    green_pixels = np.sum(np.all(np.array(final_image) == [0, 255, 0], axis=-1))
+    total_pixels = final_image.size[0] * final_image.size[1]
+    green_percentage = green_pixels / total_pixels
+
+    if green_percentage > 0.65:
+        return original  #if too much background is present, return the original image
+
+    return final_image
+
+#custom transformation that removes the background
+class BackGroundRemover(object):
+    def __call__(self, img):
+        return remove_background(img)
+
+transforms = T.Compose([
+    T.Resize(256),
+    BackGroundRemover(),
+    T.CenterCrop(240),
+    T.ToTensor(),
+    T.RandomHorizontalFlip(p = 0.5),
+])
+
+#drive.mount('/content/drive')
+#trainset = torchvision.datasets.ImageFolder('/content/drive/MyDrive/Dog/train/', transform=transforms)
+#validset = torchvision.datasets.ImageFolder('/content/drive/MyDrive/Dog/valid/',transform=transforms)
+#testset = torchvision.datasets.ImageFolder('/content/drive/MyDrive/Dog/test/',transform=transforms)
+trainset = torchvision.datasets.ImageFolder(r"C:\Users\JackH\Downloads\train", transform=transforms)
+validset = torchvision.datasets.ImageFolder(r"C:\Users\JackH\Downloads\valid",transform=transforms)
+testset = torchvision.datasets.ImageFolder(r"C:\Users\JackH\Downloads\test",transform=transforms)
 
 batch_size = 128
 
@@ -48,100 +107,176 @@ trainloader = torch.utils.data.DataLoader(trainset , batch_size=batch_size , shu
 validloader = torch.utils.data.DataLoader(validset , batch_size=batch_size , shuffle = True)
 testloader = torch.utils.data.DataLoader(testset  , batch_size=batch_size)
 
-def imshow(img):
-    npimg = img.numpy()
-    plt.imshow(np.transpose(npimg, (1, 2, 0)))
-    plt.show()
-
-# Get the first batch of training data
-dataiter = iter(trainloader)
+#gets the first batch of training data
+dataiter = iter(testloader)
 images, labels = next(dataiter)
-
-# Display the first image in the batch
-imshow(torchvision.utils.make_grid(images[0]))
-
 images, labels = images.numpy() , labels.numpy()
-
 fig = plt.figure(figsize = (20,10))
-
 for i in range(0,16):
     toAdd = fig.add_subplot(2 , int(batch_size/16) , i + 1)
     toAdd.imshow(np.transpose(images[i] , (1,2,0)))
     toAdd.set_title(trainset.classes[labels[i]])
+#helps us to view what a batch would look like after transfomations are made
+
+def calculate_overepresentation(data_frame: pd.DataFrame) -> dict:
+    _drop = {}#creates empty dictionary
+
+    eval_ = data_frame['label'].value_counts()#gets number of images for each dog breed
+    mean_ = np.round(np.mean(eval_.values))
+
+    upper_level = np.round(mean_ + (1 * np.std(eval_)))#upper threshold
+
+    for label_, obs_ in eval_.items():
+        if obs_ > upper_level:
+            _drop[label_] = abs(obs_ - upper_level)#adds this to the drop dictionary
+
+    return _drop
+class BalancedDogDataset(torch.utils.data.Dataset):
+    def __init__(self, image_folder, transform=None, drop_dict=None):
+        self.dataset = torchvision.datasets.ImageFolder(image_folder, transform=transform)
+        self.drop_dict = drop_dict or {}
+        self.filtered_indices = self._filter_indices()
+        #initializes variables
+    def _filter_indices(self):
+        filtered_indices = []
+        label_counts = {label: 0 for label in self.drop_dict.keys()}#gets counts from dictionary
+        for idx, (_, label) in enumerate(self.dataset.imgs):
+            label_name = self.dataset.classes[label]
+            if label_name in self.drop_dict and label_counts[label_name] >= self.drop_dict[label_name]:
+                continue
+            filtered_indices.append(idx)
+            if label_name in label_counts:
+                label_counts[label_name] += 1
+        return filtered_indices
+
+    def __getitem__(self, index):
+        real_idx = self.filtered_indices[index]
+        return self.dataset[real_idx]
+
+    def __len__(self):
+        return len(self.filtered_indices)
+def create_dataframe(path):
+    data = []
+    #goes over all directories in the path
+    for label in os.listdir(path):
+        label_path = os.path.join(path, label)
+        #checks if it is a directory
+        if os.path.isdir(label_path):
+            #goes over each file in the directory and adds it to the dataframe
+            for file in os.listdir(label_path):
+                file_path = os.path.join(label_path, file)
+                if os.path.isfile(file_path):
+                    data.append({'image_path': file_path, 'label': label})
+    return pd.DataFrame(data)
+
+#creates the pandas data frame object in order to calculate the overrepresentation
+#df_train = create_dataframe('/content/drive/MyDrive/Dog/train/')
+df_train = create_dataframe(r"C:\Users\JackH\Downloads\train")
+
+_drop = calculate_overepresentation(df_train)#finds which items to drop
+
+#balanced_trainset = BalancedDogDataset('/content/drive/MyDrive/Dog/train/', transform=transforms, drop_dict=_drop)
+balanced_trainset = BalancedDogDataset(r"C:\Users\JackH\Downloads\train", transform=transforms, drop_dict=_drop)#new trainset that will be used
+
+trainloader = torch.utils.data.DataLoader(balanced_trainset, batch_size=batch_size, shuffle=True)#new trainloader for new trainset
 
 """## Training The Model"""
 
 model = torchvision.models.resnet18(pretrained=True)
 model.fc = nn.Sequential(
-                      nn.Linear(model.fc.in_features, 256),
-                      nn.ReLU(),
-                      nn.Dropout(0.2),
-                      nn.Conv2d(256, 196, kernel_size=[10,10]),
-                      nn.Linear(196, len(trainset.classes)),
-                      nn.LogSoftmax(dim=1))
-
-
+    nn.Linear(model.fc.in_features, 256),
+    nn.ReLU(),
+    nn.Dropout(0.2),
+    nn.Linear(256, len(trainset.classes)),
+    nn.LogSoftmax(dim=1)
+)
 model = model.to(device)
-for inputs, labels in trainloader:
-    inputs, labels = inputs.to(device), labels.to(device)
 
-for inputs, labels in validloader:
-    inputs, labels = inputs.to(device), labels.to(device)
 
-for inputs, labels in testloader:
-    inputs, labels = inputs.to(device), labels.to(device)
-def init_weights(model):
-    for m in model.modules():
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.normal_(m.weight, mean=0, std=0.005)
-# still determining whether or not a pre-trained model is what I should use
 def fit_one_epoch(model, opt, loader):
+    model.train()  #sets the model to training mode
     losses, accuracies = [], []
-    for images, labels in tqdm.tqdm(loader):
+    for images, labels in tqdm.tqdm(loader):#loops through batches
+        images, labels = images.to(device), labels.to(device)  #moves data to the same device as the model
+        opt.zero_grad()
         prediction = model(images)
         l = loss(prediction, labels)
         acc = (prediction.argmax(1) == labels).float().mean()
-
         l.backward()
         opt.step()
-        opt.zero_grad()
-
-        losses.append(l.detach().item())
-        accuracies.append(acc.detach().item())
+        losses.append(l.item())
+        accuracies.append(acc.item())
+        #captures data from this batch
     return np.mean(losses), np.mean(accuracies)
 
 @torch.no_grad()
 def eval(model, loader):
+    model.eval()  #sets model to evaluation mode
     accuracies = []
     for images, labels in tqdm.tqdm(loader):
+        images, labels = images.to(device), labels.to(device)  #moves data to the same device as the model
         prediction = model(images)
         acc = (prediction.argmax(1) == labels).float().mean()
-        accuracies.append(acc.detach().item())
+        accuracies.append(acc.item())
     return np.mean(accuracies)
 
 
 def fit(model, loader_train, loader_test, epochs=10):
-    trl_min =1000
-    num_epochs_without_improvement= 0
+    trl_min = 0
+    num_epochs_without_improvement = 0
     opt = torch.optim.Adam(model.parameters(), lr=0.0005)
+    scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=10, gamma=0.1)  #learning rate scheduler
     hist_tr_loss, hist_tr_acc, hist_te_acc = [], [], []
     for epoch in range(epochs):
         tr_l, tr_acc = fit_one_epoch(model, opt, loader_train)
-        if(tr_l < trl_min):
-            num_epochs_without_improvement+=1
-            if(num_epochs_without_improvement>=5):
-              print("The model is no longer improving")
-              return hist_tr_loss, hist_tr_acc, hist_te_acc
-
         te_acc = eval(model, loader_test)
+        print(f"Epoch {epoch} of {epochs}: Train Loss = {tr_l:.3f}, Train Acc = {tr_acc:.3f}, Test Acc = {te_acc:.3f}", flush=True)
 
-        print(f"Finished epoch {epoch} of {epochs}: Train Loss = {tr_l:.3f}   Train Acc = {tr_acc:.3f}   Test Acc = {te_acc:.3f}", flush=True)
+        #stops the epochs if the model is no longer improving after 5 epochs
+        if te_acc > trl_min:
+            trl_min = te_acc
+            num_epochs_without_improvement = 0
+        else:
+            num_epochs_without_improvement += 1
+            if num_epochs_without_improvement >= 5:
+                print("The model is no longer improving")
+                break
+
+        scheduler.step()  #update learning rate
         hist_tr_loss.append(tr_l)
         hist_tr_acc.append(tr_acc)
         hist_te_acc.append(te_acc)
+
     return hist_tr_loss, hist_tr_acc, hist_te_acc
 
 loss = nn.CrossEntropyLoss()
-#init_weights(model)
+
 hist_tr_loss, hist_tr_acc, hist_te_acc = fit(model, trainloader, validloader, epochs=30)
 print("Our mean accuracy on the testloader is", eval(model, testloader))
+
+"""# Evaluating the Model"""
+
+test_labels = []
+test_predictions = []
+
+model.eval()
+for images, labels in tqdm.tqdm(testloader):
+    images, labels = images.to(device), labels.to(device)
+    prediction = model(images)
+    test_labels.extend(labels.cpu().numpy())
+    test_predictions.extend(prediction.argmax(1).cpu().numpy())
+
+#calculates the confusion matrix
+conf_matrix = confusion_matrix(test_labels, test_predictions)
+
+#prints the confusion matrix
+print("Confusion Matrix")
+print(conf_matrix)
+
+#plots the confusion matrix as a heatmap
+plt.figure(figsize=(10, 8))
+sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', cbar=False)
+plt.xlabel('Predicted Labels')
+plt.ylabel('True Labels')
+plt.title('Confusion Matrix')
+plt.show()
