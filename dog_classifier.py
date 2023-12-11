@@ -87,7 +87,8 @@ class BackGroundRemover(object):
 transforms = T.Compose([
     T.Resize(256),
     BackGroundRemover(),
-    T.CenterCrop(240),
+    T.Resize(212),
+    T.CenterCrop(200),
     T.ToTensor(),
     T.RandomHorizontalFlip(p = 0.5),
 ])
@@ -268,11 +269,12 @@ for images, labels in tqdm.tqdm(testloader):
     test_predictions.extend(prediction.argmax(1).cpu().numpy())
 
 #calculates the confusion matrix
-conf_matrix = confusion_matrix(test_labels, test_predictions)
+class_accuracies = conf_matrix.diagonal() / conf_matrix.sum(axis=1)
+class_names = trainset.classes
 
-#prints the confusion matrix
-print("Confusion Matrix")
-print(conf_matrix)
+#displays class accuracies
+for class_name, accuracy in zip(class_names, class_accuracies):
+    print(f"{class_name} with {accuracy * 100:.2f}% accuracy")
 
 #plots the confusion matrix as a heatmap
 plt.figure(figsize=(10, 8))
